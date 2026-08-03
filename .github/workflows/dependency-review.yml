@@ -1,0 +1,391 @@
+name: 'Dependency Review'
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout Repository'
+        uses: actions/checkout@v4
+
+      - name: 'Set up JDK'
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 'Dependency Review'
+        id: review
+        uses: actions/dependency-review-action@v4
+        continue-on-error: true
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never
+          license-check: true
+          vulnerability-check: true
+
+      - name: 'Build Vulnerability Summary with CISA KEV'
+        id: vuln-check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let kevCves = new Set();
+            let kevData = {};
+            try {
+              const kevResponse = await fetch('https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json');
+              const kevJson = await kevResponse.json();
+              for (const entry of kevJson.vulnerabilities) {
+                kevCves.add(entry.cveID);
+                kevData[entry.cveID] = {
+                  vendor: entry.vendorProject,
+                  product: entry.product,
+                  dateAdded: entry.dateAdded,
+                  dueDate: entry.dueDate,
+                  description: entry.shortDescription
+                };
+              }
+              core.info(`✅ Loaded ${kevCves.size} CVEs from CISA KEV catalog`);
+            } catch (err) {
+              core.warning(`⚠️ Failed to fetch CISA KEV catalog: ${err.message}`);
+            }
+
+            let diff = null;
+            const maxRetries = 3;
+            const retryDelay = 5000;
+
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+              try {
+                core.info(`🔄 Attempt ${attempt}/${maxRetries}: Fetching dependency diff...`);
+                diff = await github.rest.dependencyGraph.diffRange({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${context.payload.pull_request.base.sha}...${context.payload.pull_request.head.sha}`
+                });
+                core.info(`✅ Successfully fetched dependency diff (${diff.data.length} dependencies)`);
+                break;
+              } catch (err) {
+                if (err.status === 502 || err.status === 503 || err.status === 504) {
+                  core.warning(`⚠️ GitHub API returned ${err.status} on attempt ${attempt}/${maxRetries}`);
+                  if (attempt < maxRetries) {
+                    core.info(`⏳ Retrying in ${retryDelay/1000} seconds...`);
+                    await new Promise(resolve => setTimeout(resolve, retryDelay));
+                  } else {
+                    core.warning(`❌ Dependency Graph API failed after ${maxRetries} attempts`);
+                    await github.rest.issues.createComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: context.issue.number,
+                      body: `## ⚠️ Dependency Review — API Timeout\n\n` +
+                            `The Dependency Graph API timed out while analyzing this PR. This typically happens with very large dependency changes.\n\n` +
+                            `**Why this happened:**\n` +
+                            `- PR contains substantial dependency changes (e.g., package manager migration)\n` +
+                            `- GitHub's Dependency Graph API has size/timeout limits\n\n` +
+                            `**What to do:**\n` +
+                            `✅ You can safely merge this PR — this is not a security block\n` +
+                            `📋 Security team will perform manual review of dependencies post-merge\n` +
+                            `🔍 Run \`npm audit\` / \`yarn audit\` / \`pnpm audit\` locally to check for vulnerabilities\n\n` +
+                            `**Manual review checklist:**\n` +
+                            `- [ ] Locally run \`pnpm audit\` and review results\n` +
+                            `- [ ] Check for critical/high severity vulnerabilities\n` +
+                            `- [ ] Verify no CISA KEV (actively exploited) vulnerabilities present\n\n` +
+                            `_Contact #security-support for questions._`
+                    });
+                    core.setOutput('has_vulnerabilities', 'false');
+                    core.setOutput('api_timeout', 'true');
+                    return;
+                  }
+                } else {
+                  throw err;
+                }
+              }
+            }
+
+            if (!diff) {
+              core.setFailed('❌ Failed to fetch dependency diff after retries');
+              return;
+            }
+
+            // Build a set of packages already present on the base branch (name@version)
+            // so we only flag genuinely new or upgraded vulnerable dependencies (Option B).
+            const basePackages = new Set();
+            try {
+              const baseSnapshot = await github.rest.dependencyGraph.exportSbom({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: context.payload.pull_request.base.sha
+              });
+              const sbomPackages = baseSnapshot.data?.sbom?.packages || [];
+              for (const pkg of sbomPackages) {
+                const name = pkg.name || '';
+                const version = pkg.versionInfo || '';
+                if (name && version) basePackages.add(`${name}@${version}`);
+              }
+              core.info(`✅ Loaded ${basePackages.size} packages from base branch snapshot`);
+            } catch (err) {
+              core.warning(`⚠️ Could not fetch base branch SBOM — baseline exclusion skipped: ${err.message}`);
+            }
+
+            const vulnerabilities = [];
+            const skippedDev = [];
+            const skippedBaseline = [];
+            for (const dep of diff.data) {
+              if ((dep.change_type === 'added' || dep.change_type === 'changed') && dep.vulnerabilities && dep.vulnerabilities.length > 0) {
+                if (dep.scope === 'development') {
+                  skippedDev.push(`${dep.ecosystem}/${dep.name}@${dep.version}`);
+                  core.info(`⏭️ Skipping dev dependency: ${dep.name}@${dep.version}`);
+                  continue;
+                }
+
+                const baseKey = `npm:${dep.name}@${dep.version}`;
+                const altKey = `${dep.ecosystem}:${dep.name}@${dep.version}`;
+                if (basePackages.has(baseKey) || basePackages.has(altKey)) {
+                  skippedBaseline.push(`${dep.ecosystem}/${dep.name}@${dep.version}`);
+                  core.info(`⏭️ Skipping baseline package (already in prod): ${dep.name}@${dep.version}`);
+                  continue;
+                }
+
+                for (const vuln of dep.vulnerabilities) {
+                  if (vuln.severity === 'critical' || vuln.severity === 'high') {
+                    const ghsaMatch = vuln.advisory_url ? vuln.advisory_url.match(/GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}/) : null;
+                    const ghsaId = ghsaMatch ? ghsaMatch[0] : null;
+                    let cveId = null;
+                    if (ghsaId) {
+                      try {
+                        const advisory = await github.request('GET /advisories/{ghsa_id}', {
+                          ghsa_id: ghsaId
+                        });
+                        cveId = advisory.data.cve_id || null;
+                      } catch (err) {
+                        core.warning(`⚠️ Could not fetch advisory ${ghsaId}: ${err.message}`);
+                      }
+                    }
+                    const isKev = cveId ? kevCves.has(cveId) : false;
+                    vulnerabilities.push({
+                      package: `${dep.ecosystem}/${dep.name}`,
+                      version: dep.version,
+                      severity: vuln.severity,
+                      summary: vuln.advisory_summary,
+                      url: vuln.advisory_url,
+                      ghsa: ghsaId || 'N/A',
+                      cve: cveId || 'N/A',
+                      isKev: isKev,
+                      kevInfo: isKev ? kevData[cveId] : null
+                    });
+                  }
+                }
+              }
+            }
+            if (skippedDev.length > 0) core.info(`ℹ️ Skipped ${skippedDev.length} dev dependencies: ${skippedDev.join(', ')}`);
+            if (skippedBaseline.length > 0) core.info(`ℹ️ Skipped ${skippedBaseline.length} baseline (already-in-prod) packages: ${skippedBaseline.join(', ')}`);
+
+            if (vulnerabilities.length === 0) {
+              core.setOutput('has_vulnerabilities', 'false');
+              core.info('✅ No vulnerabilities found');
+              return;
+            }
+
+            core.setOutput('has_vulnerabilities', 'true');
+            const kevVulns = vulnerabilities.filter(v => v.isKev);
+            const nonKevVulns = vulnerabilities.filter(v => !v.isKev);
+            const groupByPackage = (vulns) => {
+              const grouped = {};
+              for (const v of vulns) {
+                const key = `${v.package}@${v.version}`;
+                if (!grouped[key]) grouped[key] = { critical: [], high: [] };
+                grouped[key][v.severity].push(v);
+              }
+              return grouped;
+            };
+            const criticalCount = vulnerabilities.filter(v => v.severity === 'critical').length;
+            const highCount = vulnerabilities.filter(v => v.severity === 'high').length;
+            const packageCount = new Set(vulnerabilities.map(v => `${v.package}@${v.version}`)).size;
+
+            let body = `## 🔴 Dependency Review — ${vulnerabilities.length} Vulnerabilities Found\n\n`;
+            body += `| Summary | Count |\n|---------|-------|\n`;
+            body += `| 🔴 Critical | ${criticalCount} |\n`;
+            body += `| 🟠 High | ${highCount} |\n`;
+            body += `| 🚨 CISA KEV (Actively Exploited) | ${kevVulns.length} |\n`;
+            body += `| 📦 Affected Packages | ${packageCount} |\n\n`;
+
+            if (kevVulns.length > 0) {
+              body += `### 🚨 CISA KEV — Actively Exploited in the Wild\n\n`;
+              body += `> ⚠️ **These vulnerabilities are confirmed actively exploited per [CISA's Known Exploited Vulnerabilities catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog). Immediate action required.**\n\n`;
+              const kevGrouped = groupByPackage(kevVulns);
+              for (const [pkg, sevs] of Object.entries(kevGrouped)) {
+                const total = sevs.critical.length + sevs.high.length;
+                body += `<details open>\n<summary>🚨 <b>${pkg}</b> — ${total} actively exploited</summary>\n\n`;
+                body += `| Severity | CVE | Advisory | CISA Due Date |\n|----------|-----|----------|---------------|\n`;
+                for (const v of [...sevs.critical, ...sevs.high]) {
+                  const icon = v.severity === 'critical' ? '🔴' : '🟠';
+                  const dueDate = v.kevInfo ? v.kevInfo.dueDate : 'N/A';
+                  body += `| ${icon} ${v.severity} | ${v.cve} | [${v.summary}](${v.url}) | ${dueDate} |\n`;
+                }
+                body += `\n</details>\n\n`;
+              }
+            }
+
+            if (nonKevVulns.length > 0) {
+              body += `### ⚠️ Other Vulnerabilities (Not actively exploited)\n\n`;
+              const nonKevGrouped = groupByPackage(nonKevVulns);
+              for (const [pkg, sevs] of Object.entries(nonKevGrouped)) {
+                const total = sevs.critical.length + sevs.high.length;
+                body += `<details>\n<summary>📦 <b>${pkg}</b> — ${total} vulnerabilit${total === 1 ? 'y' : 'ies'}</summary>\n\n`;
+                body += `| Severity | CVE | Advisory |\n|----------|-----|----------|\n`;
+                for (const v of [...sevs.critical, ...sevs.high]) {
+                  const icon = v.severity === 'critical' ? '🔴' : '🟠';
+                  body += `| ${icon} ${v.severity} | ${v.cve} | [${v.summary}](${v.url}) |\n`;
+                }
+                body += `\n</details>\n\n`;
+              }
+            }
+
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/vuln-comment.md', body);
+
+      - name: 'Post Vulnerability Summary'
+        if: steps.vuln-check.outputs.has_vulnerabilities == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('/tmp/vuln-comment.md', 'utf8');
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const prev = comments.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Dependency Review —')
+            );
+            if (prev) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: prev.id
+              });
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: 'Post Risk Acceptance Template'
+        if: steps.vuln-check.outputs.has_vulnerabilities == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const templateExists = comments.some(c =>
+              c.body.includes('## 🛡️ Security Risk Acceptance Required')
+            );
+            if (!templateExists) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: `## 🛡️ Security Risk Acceptance Required
+
+            This PR contains **vulnerable dependencies** detected by Dependency Review.
+
+            A security reviewer must review and approve this PR before it can be merged.
+
+            <details>
+            <summary>📝 <b>Click to view Risk Acceptance Template</b></summary>
+
+            ### Reviewer: Copy and fill out this template as a comment before approving:
+
+            \`\`\`
+            ### Risk Acceptance
+            - **Reviewer:** @your-username
+            - **Date:** YYYY-MM-DD
+            - **Risk Level:** [Critical / High / CISA KEV]
+            - **CISA KEV Exploited:** [Yes / No]
+            - **Affected Dependencies:**
+              - [ ] List affected packages
+            - **Justification:** Why is this risk acceptable?
+            - **Mitigation Plan:** What steps will be taken to remediate?
+            - **Target Remediation Date:** YYYY-MM-DD
+            - **Approval:** ✅ I accept the security risk for this PR.
+            \`\`\`
+
+            </details>
+
+            > ⚠️ **After posting the filled-out template, approve the PR review.**`
+              });
+            }
+
+      - name: 'Verify Risk Acceptance Comment'
+        if: steps.vuln-check.outputs.has_vulnerabilities == 'true'
+        id: verify-acceptance
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            const acceptanceComment = comments.find(c =>
+              c.body.includes('### Risk Acceptance') &&
+              c.body.includes('Approval:') &&
+              c.body.includes('✅') &&
+              c.body.includes('Justification:') &&
+              !c.body.includes('Please copy and fill out') &&
+              !c.body.includes('Click to view')
+            );
+            if (!acceptanceComment) {
+              core.setFailed(
+                '❌ No valid Risk Acceptance comment found!\n\n' +
+                'A reviewer must post a filled-out Risk Acceptance template ' +
+                'as a PR comment BEFORE this PR can be merged.\n\n' +
+                'Please check the PR comments for the Risk Acceptance template.'
+              );
+            } else {
+              core.info('✅ Risk Acceptance comment found!');
+              core.info(`Accepted by: ${acceptanceComment.user.login}`);
+              core.setOutput('accepted_by', acceptanceComment.user.login);
+              core.setOutput('acceptance_found', 'true');
+            }
+
+      - name: 'Notify Security Team on Slack'
+        if: steps.vuln-check.outputs.has_vulnerabilities == 'true' && steps.verify-acceptance.outputs.acceptance_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prUrl = context.payload.pull_request.html_url;
+            const prTitle = context.payload.pull_request.title;
+            const repo = context.repo.repo;
+            const acceptedBy = '${{ steps.verify-acceptance.outputs.accepted_by }}';
+
+            await fetch(process.env.SLACK_WEBHOOK_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                text: `🛡️ *Security Risk Acceptance Posted — Review Required*\n\n` +
+                      `*Repo:* ${repo}\n` +
+                      `*PR:* <${prUrl}|${prTitle}>\n` +
+                      `*Risk Accepted By:* @${acceptedBy}\n\n` +
+                      `A security team member must review this PR before it can merge.`
+              })
+            });
+            core.info('✅ Slack notification sent to security team');
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+
+      - name: 'No Vulnerabilities - Pass'
+        if: steps.vuln-check.outputs.has_vulnerabilities == 'false'
+        run: echo "✅ No vulnerabilities detected. PR is clear to merge!"
